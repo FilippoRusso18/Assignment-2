@@ -12,6 +12,13 @@ output_path_tables = Path(r"C:\Users\fipli\OneDrive - UvA\TI Master content\2.3 
 output_path_pic.mkdir(parents=True, exist_ok=True)
 output_path_tables.mkdir(parents=True, exist_ok=True)
 
+# ## Code for linear shrinkage
+
+# ======================================================================
+# Q1.1
+# ======================================================================
+# ## Q1.1
+
 N = 50
 T = 100
 B = 1000
@@ -77,6 +84,11 @@ fig.tight_layout(rect=[0, 0.06, 1, 0.93])
 plt.show()
 out_path = output_path_pic / "A2_Fig1.png" 
 fig.savefig(out_path, dpi=300, bbox_inches="tight")
+
+# ======================================================================
+# Q1.2
+# ======================================================================
+# ## Q1.2
 
 def cov1Para(Y,k = None): #the code to obtain this linear shrinkage function is 
                           #retrieved from the following github repository: https://github.com/pald22/covShrinkage/blob/main/cov1Para.py
@@ -160,6 +172,11 @@ plt.show()
 out_path = output_path_pic / "A2_Fig2.png" 
 fig.savefig(out_path, dpi=300, bbox_inches="tight")
 
+# ======================================================================
+# Q1.3
+# ======================================================================
+# ## Q1.3
+
 oracle_eigs = np.zeros((B, N))
 sigma_oracle = np.zeros((B, N, N))
 
@@ -200,6 +217,11 @@ plt.show()
 
 print(avg_eigs_oracle)
 print(pop_eigs)
+
+# ======================================================================
+# Q1.4
+# ======================================================================
+# ## Q1.4
 
 N = 50
 T = 100
