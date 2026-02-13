@@ -534,289 +534,107 @@ ab_hat, alpha_hat, beta_hat, nll_hat, success, messages, summary = estimate_ab_s
      n_jobs=-1
  )
 #
-print("Success rate per strategy [no, linear, oracle]:", summary["success_rate"])
-print("alpha mean:", summary["alpha_mean"])
-print("beta  mean:", summary["beta_mean"])
-print("alpha sd:", summary["alpha_sd"])
-print("beta  sd:", summary["beta_sd"])
-
 print("alpha mean:", summary["alpha_mean"])
 print("beta  mean:", summary["beta_mean"])
 print("alpha se:", summary["alpha_sd"]/np.sqrt(B))
 print("beta  se:", summary["beta_sd"]/np.sqrt(B))
 
-# ============================================================
-# 1) Transform: (a,b) -> (alpha,beta) with alpha,beta >= 0 and alpha+beta < 1
-# ============================================================
-def alpha_beta_from_ab(a, b):
-    ea, eb = np.exp(a), np.exp(b)
-    den = 1.0 + ea + eb
-    alpha = ea / den
-    beta  = eb / den
-    return alpha, beta
+# Build table where each cell shows mean on top and SE in parentheses below
+rows = []
+strategies = ["No Shrinkage", "Linear Shrinkage", "Oracle"]
+for s in range(3):
+    a_mean = summary["alpha_mean"][s]
+    a_se = summary["alpha_sd"][s] / np.sqrt(B)
+    b_mean = summary["beta_mean"][s]
+    b_se = summary["beta_sd"][s] / np.sqrt(B)
+
+    # Use LaTeX linebreak \\ inside the cell (escape=False below keeps it literal)
+    a_cell = "{:.4f}\\ ({:.4f})".format(a_mean, a_se)
+    b_cell = "{:.4f}\\ ({:.4f})".format(b_mean, b_se)
+
+    rows.append({"Strategy": strategies[s], "Alpha": a_cell, "Beta": b_cell})
+
+df_summary = pd.DataFrame(rows)
+# Export as LaTeX without escaping so the \\ linebreaks render in the .tex
+latex_table = df_summary.to_latex(index=False, escape=False)
+(output_path_tables / "bekk_estimation_summary.tex").write_text(latex_table, encoding="utf-8")
+print("Saved summary table to:", (output_path_tables / "bekk_estimation_summary.tex").resolve())
+
+# minimum-variance portfolio weights using Cholesky (stable, no explicit inverse)
+def min_var_weights(cov_matrix, jitter=1e-8, use_pin=False):
+    """Compute minimum-variance portfolio weights w = Sigma^{-1}1 / (1' Sigma^{-1} 1)"""
+    n = cov_matrix.shape[0]
+    ones = np.ones(n)
+    try:
+        L = cholesky(cov_matrix, lower=True, check_finite=False)
+    except np.linalg.LinAlgError:
+        # not positive definite: either use pseudoinverse or add tiny jitter and retry
+        if use_pin:
+            pinv = np.linalg.pinv(cov_matrix)
+            x = pinv @ ones
+            return x / (ones @ x)
+        cov_matrix = cov_matrix + jitter * np.eye(n)
+        L = cholesky(cov_matrix, lower=True, check_finite=False)
+    # solve Sigma x = ones via two triangular solves (avoids forming inverse)
+    y = solve_triangular(L, ones, lower=True, check_finite=False)
+    x = solve_triangular(L.T, y, lower=False, check_finite=False)
+    weights = x / (ones @ x)
+    return weights
 
 
-
-# ============================================================
-# 2) Build init_H_generic: (B,3,N,N)
-# ============================================================
-def build_init_H_generic(B, N, init_H_no_shrink, init_H_linear, init_H_oracle):
-    if init_H_no_shrink.ndim == 2:
-        base = np.stack([init_H_no_shrink, init_H_linear, init_H_oracle], axis=0)  # (3,N,N)
-        init_H_generic = np.broadcast_to(base, (B, 3, N, N)).copy()
-    elif init_H_no_shrink.ndim == 3:
-        init_H_generic = np.stack([init_H_no_shrink, init_H_linear, init_H_oracle], axis=1)  # (B,3,N,N)
-    else:
-        raise ValueError("init_H_* must be either (N,N) or (B,N,N).")
-    return init_H_generic
-
-
-# ============================================================
-# 3) Negative log-likelihood for ONE simulation b and ONE strategy s
-# ============================================================
-def neg_loglik_one_b_one_s(params_ab, y_b, Hbar_s):
-    """
-    params_ab: array-like length 2 => (a,b) unconstrained
-    y_b: (T,N)
-    Hbar_s: (N,N) fixed unconditional covariance target for strategy s
-    """
-    a_raw, b_raw = params_ab
-    alpha, beta = alpha_beta_from_ab(a_raw, b_raw)
-
-    T, N = y_b.shape
-
-    # Precompute yy_t = y_t y_t'
-    yy = np.einsum("tn,tm->tnm", y_b, y_b)  # (T,N,N)
-
-    H = Hbar_s.copy()
-    nll = 0.0
-
+# Compute min-var weights for each estimated covariance, for each simulation, and for each time point
+# store weights as (B,T,N) and portfolio returns as (B,T)
+min_var_weights_no_shrink = np.zeros((B, T, N))
+min_var_weights_linear = np.zeros((B, T, N))
+min_var_weights_oracle = np.zeros((B, T, N))
+portfolio_returns_no_shrink = np.zeros((B, T))
+portfolio_returns_linear = np.zeros((B, T))
+portfolio_returns_oracle = np.zeros((B, T))
+for b in range(B):
+    # initialize conditional covariances at their estimated unconditional values
+    sigma_t_no_shrink = no_shrunk_estimated_sigma.copy()
+    sigma_t_linear = linear_shrunk_estimated_sigma.copy()
+    sigma_t_oracle = oracle_estimated_sigma.copy()
     for t in range(T):
-        y = y_b[t]  # (N,)
+        # compute min-var weights from current Sigma_t (Cholesky-based implementation)
+        w_no = min_var_weights(sigma_t_no_shrink)
+        w_lin = min_var_weights(sigma_t_linear)
+        w_or = min_var_weights(sigma_t_oracle)
 
-        # Cholesky factorization: H = L L'
-        try:
-            L = cholesky(H, lower=True, check_finite=False)
-        except np.linalg.LinAlgError:
-            return np.inf
+        min_var_weights_no_shrink[b, t, :] = w_no
+        min_var_weights_linear[b, t, :] = w_lin
+        min_var_weights_oracle[b, t, :] = w_or
 
-        logdet = 2.0 * np.sum(np.log(np.diag(L)))
-        z = solve_triangular(L, y, lower=True, check_finite=False)
-        quad = float(np.dot(z, z))
+        # portfolio return at time t for simulation b
+        portfolio_returns_no_shrink[b, t] = float(np.dot(w_no, y_simulated[b, t]))
+        portfolio_returns_linear[b, t] = float(np.dot(w_lin, y_simulated[b, t]))
+        portfolio_returns_oracle[b, t] = float(np.dot(w_or, y_simulated[b, t]))
 
-        nll += 0.5 * (logdet + quad)
+        # update Sigma_t for next period using estimated alpha/beta for this simulation
+        sigma_t_no_shrink = (1 - alpha_hat[b, 0] - beta_hat[b, 0]) * no_shrunk_estimated_sigma + alpha_hat[b, 0] * np.outer(y_simulated[b, t], y_simulated[b, t]) + beta_hat[b, 0] * sigma_t_no_shrink
+        sigma_t_linear = (1 - alpha_hat[b, 1] - beta_hat[b, 1]) * linear_shrunk_estimated_sigma + alpha_hat[b, 1] * np.outer(y_simulated[b, t], y_simulated[b, t]) + beta_hat[b, 1] * sigma_t_linear
+        sigma_t_oracle = (1 - alpha_hat[b, 2] - beta_hat[b, 2]) * oracle_estimated_sigma + alpha_hat[b, 2] * np.outer(y_simulated[b, t], y_simulated[b, t]) + beta_hat[b, 2] * sigma_t_oracle
+# compute average and variance of portfolio returns across time and across simulations
+# overall mean/var across both axes
+mean_no = portfolio_returns_no_shrink.mean()
+var_no = portfolio_returns_no_shrink.var(ddof=1)
+mean_lin = portfolio_returns_linear.mean()
+var_lin = portfolio_returns_linear.var(ddof=1)
+mean_or = portfolio_returns_oracle.mean()
+var_or = portfolio_returns_oracle.var(ddof=1)
 
-        # Update
-        if t < T - 1:
-            H = (1.0 - alpha - beta) * Hbar_s + alpha * yy[t] + beta * H
+print('Min-var portfolio — No shrink: mean={}, var={}'.format(mean_no, var_no))
+print('Min-var portfolio — Linear shrink: mean={}, var={}'.format(mean_lin, var_lin))
+print('Min-var portfolio — Oracle: mean={}, var={}'.format(mean_or, var_or))
 
-    return nll
-
-
-# ============================================================
-# 4) Estimate (alpha,beta) for one simulation b, separately for each strategy s
-# ============================================================
-def estimate_one_b_separate(b, y_simulated, init_H_generic, x0_ab, method, options):
-    """
-    Returns for simulation b:
-      ab_hat:    (3,2)  raw params (a,b) per strategy
-      alpha_hat: (3,)   alpha per strategy
-      beta_hat:  (3,)   beta  per strategy
-      nll_hat:   (3,)   minimized nll per strategy
-      success:   (3,)   success flags
-      message:   list length 3
-    """
-    y_b = y_simulated[b]          # (T,N)
-    Hbar_b = init_H_generic[b]    # (3,N,N)
-
-    ab_hat = np.zeros((3, 2))
-    alpha_hat = np.zeros(3)
-    beta_hat  = np.zeros(3)
-    nll_hat   = np.zeros(3)
-    success   = np.zeros(3, dtype=bool)
-    messages  = [""] * 3
-
-    for s in range(3):
-        obj = lambda p: neg_loglik_one_b_one_s(p, y_b, Hbar_b[s])
-        res = minimize(obj, x0=np.asarray(x0_ab, dtype=float), method=method, options=options)
-
-        ab_hat[s] = res.x
-        a_s, b_s = alpha_beta_from_ab(res.x[0], res.x[1])
-        alpha_hat[s] = a_s
-        beta_hat[s]  = b_s
-        nll_hat[s]   = res.fun
-        success[s]   = res.success
-        messages[s]  = str(res.message)
-
-    return ab_hat, alpha_hat, beta_hat, nll_hat, success, messages
-
-
-# ============================================================
-# 5) Parallel Monte Carlo estimation: B simulations (each runs 3 separate optimizations)
-# ============================================================
-def estimate_ab_separate_per_strategy_parallel(
-    y_simulated,
-    init_H_no_shrink,
-    init_H_linear,
-    init_H_oracle,
-    x0_ab=(0.0, 0.0),
-    method="L-BFGS-B",
-    options=None,
-    n_jobs=-1
-):
-    """
-    y_simulated: (B,T,N)
-    Returns:
-      ab_hat:    (B,3,2)
-      alpha_hat: (B,3)
-      beta_hat:  (B,3)
-      nll_hat:   (B,3)
-      success:   (B,3)
-      messages:  list length B, each is list length 3
-      summary:   dict with means/sds per strategy
-    """
-    B, T, N = y_simulated.shape
-    init_H_generic = build_init_H_generic(B, N, init_H_no_shrink, init_H_linear, init_H_oracle)
-
-    if options is None:
-        options = {"maxiter": 20}
-
-    results = Parallel(n_jobs=n_jobs, backend="loky")(
-        delayed(estimate_one_b_separate)(b, y_simulated, init_H_generic, x0_ab, method, options)
-        for b in range(B)
-    )
-
-    ab_hat    = np.stack([r[0] for r in results], axis=0)  # (B,3,2)
-    alpha_hat = np.stack([r[1] for r in results], axis=0)  # (B,3)
-    beta_hat  = np.stack([r[2] for r in results], axis=0)  # (B,3)
-    nll_hat   = np.stack([r[3] for r in results], axis=0)  # (B,3)
-    success   = np.stack([r[4] for r in results], axis=0)  # (B,3)
-    messages  = [r[5] for r in results]
-
-    # summary per strategy s
-    summary = {
-        "success_rate": success.mean(axis=0),  # (3,)
-        "alpha_mean": alpha_hat.mean(axis=0),
-        "alpha_sd": alpha_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
-        "beta_mean": beta_hat.mean(axis=0),
-        "beta_sd": beta_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
-        "nll_mean": nll_hat.mean(axis=0),
-        "nll_sd": nll_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
-    }
-
-    return ab_hat, alpha_hat, beta_hat, nll_hat, success, messages, summary
-
-
-# ============================================================
-# 6) Example call
-# ============================================================
-ab_hat, alpha_hat, beta_hat, nll_hat, success, messages, summary = estimate_ab_separate_per_strategy_parallel(
-     y_simulated=y_simulated,
-     init_H_no_shrink=no_shrunk_estimated_sigma,
-     init_H_linear=linear_shrunk_estimated_sigma,
-     init_H_oracle=sigma_oracle_estimated,
-     x0_ab=(0.0, 0.0),
-     method="L-BFGS-B",
-     options={"maxiter": 20},
-     n_jobs=-1
- )
-#
-print("Success rate per strategy [no, linear, oracle]:", summary["success_rate"])
-print("alpha mean:", summary["alpha_mean"])
-print("beta  mean:", summary["beta_mean"])
-print("alpha sd:", summary["alpha_sd"])
-print("beta  sd:", summary["beta_sd"])
-
-    for t in range(T):
-        H_t = (1 - alpha - beta) * Sigma_bar + alpha * np.outer(y_prev, y_prev) + beta * H_t
-
-        # Cholesky for logdet and quadratic form
-        try:
-            L = cholesky(H_t)
-        except np.linalg.LinAlgError:
-            return 1e50  # non-PD penalty
-
-        # log |Sig_t| = 2 sum log diag(L)
-        logdet = 2.0 * np.sum(np.log(np.diag(L)))
-
-        # quad = y_t' Sig_t^{-1} y_t via solve with Cholesky
-        y_t = Y[t]
-        # solve L x = y, then L' z = x => z = Sig^{-1} y
-        x = solve(L, y_t)
-        quad = x @ x
-
-        nll += 0.5 * (logdet + quad + const)
-        y_prev = y_t
-
-    return nll
-
-def fit_ab_qml(Y, Sigma_bar, uv0=(np.log(0.05/0.02), np.log(0.93/0.02))):
-    # uv0 just gives a starting point; any finite numbers are ok.
-    res = minimize(
-        neg_qml_uv,
-        x0=np.array(uv0, dtype=float),
-        args=(Y, Sigma_bar),
-        method="Nelder-Mead",
-        options={"maxiter": 5000, "xatol": 1e-6, "fatol": 1e-6}
-    )
-    u_hat, v_hat = res.x
-    a_hat, b_hat = ab_from_uv(u_hat, v_hat)
-    return a_hat, b_hat, res
-
-def fitted_sigmas(Y, Sigma_bar, alpha, beta):
-    T, N = Y.shape
-    Sigmas = np.zeros((T, N, N))
-    Sig_t = Sigma_bar.copy()
-    y_prev = Y[0]
-    for t in range(T):
-        Sig_t = (1 - alpha - beta) * Sigma_bar + alpha * np.outer(y_prev, y_prev) + beta * Sig_t
-        Sigmas[t] = Sig_t
-        y_prev = Y[t]
-    return Sigmas
-
-def minvar_portfolio_var(Y, Sigmas):
-    T, N = Y.shape
-    one = np.ones(N)
-    rets = np.zeros(T)
-    for t in range(T):
-        Sig = Sigmas[t]
-        # w = Sig^{-1}1 / (1' Sig^{-1} 1)
-        x = np.linalg.solve(Sig, one)
-        w = x / (one @ x)
-        rets[t] = w @ Y[t]
-    return np.var(rets, ddof=1)
-
-# -----------------------------
-# Monte Carlo experiment
-# -----------------------------
-def run_mc(N=50, T=100, B=500, rho=0.5, alpha0=0.05, beta0=0.93, seed=1827):
-    rng = np.random.default_rng(seed)
-    Sigma_true = equicorr_sigma(N, rho)
-
-    methods = {
-        "Sample": no_shrink,
-        "LinearShrink": lambda S: shrink_to_identity(S, delta=0.2),   # replace with your delta estimator
-        "EigAvg(N-1)": eigen_avg_first_Nm1,
-    }
-
-    out = {k: [] for k in methods.keys()}
-
-    for b in range(B):
-        Y = simulate_vec_bekk(T, Sigma_true, alpha0, beta0, rng)
-
-        S = sample_cov(Y)
-
-        for name, Sigma_hat_fn in methods.items():
-            Sigma_bar_hat = Sigma_hat_fn(S)
-
-            a_hat, b_hat, _ = fit_ab_qml(Y, Sigma_bar_hat)
-            Sigmas_hat = fitted_sigmas(Y, Sigma_bar_hat, a_hat, b_hat)
-
-            pv = minvar_portfolio_var(Y, Sigmas_hat)
-            out[name].append(pv)
-
-    # averages over MC replications
-    return {k: (np.mean(v), np.std(v)) for k, v in out.items()}
-
-
-results = run_mc(N=50, T=100, B=1000, rho=0.5)
+#create table with mean and var for each strategy
+rows = []
+strategies = ["No Shrinkage", "Linear Shrinkage", "Oracle"]
+for s, (mean, var) in enumerate([(mean_no, var_no), (mean_lin, var_lin), (mean_or, var_or)]):
+    mean_cell = "{:.6f}".format(mean)
+    var_cell = "{:.6f}".format(var)
+    rows.append({"Strategy": strategies[s], "Mean Return": mean_cell, "Variance of Return": var_cell})
+df_portfolio = pd.DataFrame(rows)
+latex_table_portfolio = df_portfolio.to_latex(index=False, escape=False)
+(output_path_tables / "portfolio_performance_summary.tex").write_text(latex_table_portfolio, encoding="utf-8")
+print("Saved portfolio performance summary to:", (output_path_tables / "portfolio_performance_summary.tex").resolve())
