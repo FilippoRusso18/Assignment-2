@@ -1,11 +1,20 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import math
 from pathlib import Path
-from scipy.linalg import cholesky, solve_triangular
+from scipy.linalg import cholesky, solve_triangular, cho_factor, cho_solve
 from scipy.optimize import minimize
 from joblib import Parallel, delayed
+import re
+import os
+from threadpoolctl import threadpool_limits
+
+# ============================================================
+# 0) Mapping: (a,b) -> (alpha,beta) with alpha,beta >= 0 and alpha+beta < 1
+#    alpha = exp(a)/(1+exp(a)+exp(b)), be
+
 output_path_pic = Path(r"C:\Users\fipli\OneDrive - UvA\TI Master content\2.3 Advanced Time Series Econometrics\Assignment 2\Pictures Assignment 2")
 output_path_tables = Path(r"C:\Users\fipli\OneDrive - UvA\TI Master content\2.3 Advanced Time Series Econometrics\Assignment 2\latex_tables")
 output_path_pic.mkdir(parents=True, exist_ok=True)
@@ -222,135 +231,171 @@ print(pop_eigs)
 # ======================================================================
 # ## Q1.4
 
-N = 50
-T = 100
-B = 1000
-rho = 0.5
-seed = 1827
-alpha = 0.05
-beta = 0.93
+import os
+import numpy as np
+from scipy.linalg import cho_factor, cho_solve
+from scipy.optimize import minimize
+from joblib import Parallel, delayed
+from threadpoolctl import threadpool_limits
 
-rng = np.random.default_rng(seed)
+# ============================================================
+# 0) Mapping: (a,b) -> (alpha,beta) with alpha,beta >= 0 and alpha+beta < 1
+#    alpha = exp(a)/(1+exp(a)+exp(b)), beta = exp(b)/(1+exp(a)+exp(b))
+# ============================================================
+def alpha_beta_from_ab(a, b):
+    ea = np.exp(a)
+    eb = np.exp(b)
+    den = 1.0 + ea + eb
+    return ea / den, eb / den
 
-I = np.eye(N)
-one = np.ones((N, 1))
-equicorr_sigma = (1 - rho) * I + rho * (one @ one.T)
 
-def simulate_bekk_vec(T, alpha, beta, rng):
-    """
-    Simulate y_t from:
-      Sigma_t = (1-a-b) Sigma + a y_{t-1} y'_{t-1} + b Sigma_{t-1}
-      y_t | F_{t-1} ~ N(0, Sigma_t)
-    """
-    N = equicorr_sigma.shape[0]
-    y = np.zeros((T, N))
-    Sig_t = equicorr_sigma.copy()  # Sigma_0
-    Sig_prev = Sig_t
-    y_prev = rng.multivariate_normal(np.zeros(N), equicorr_sigma)
+# ============================================================
+# 1) Build init_H_generic: (B,3,N,N)
+# ============================================================
+def build_init_H_generic(B, N, init_H_no_shrink, init_H_linear, init_H_oracle):
+    if init_H_no_shrink.ndim == 2:
+        base = np.stack([init_H_no_shrink, init_H_linear, init_H_oracle], axis=0)  # (3,N,N)
+        init_H_generic = np.broadcast_to(base, (B, 3, N, N)).copy()
+    elif init_H_no_shrink.ndim == 3:
+        init_H_generic = np.stack([init_H_no_shrink, init_H_linear, init_H_oracle], axis=1)  # (B,3,N,N)
+    else:
+        raise ValueError("init_H_* must be either (N,N) or (B,N,N).")
+    return init_H_generic
 
+
+# ============================================================
+# 2) Negative log-likelihood for ONE simulation b and ONE strategy s
+#    Key speed-ups:
+#      - yy is precomputed OUTSIDE objective (once per replication b)
+#      - use cho_factor + cho_solve (slightly faster + stable)
+#      - avoid repeated allocations inside loop
+# ============================================================
+def neg_loglik_one_b_one_s(params_ab, y_b, yy, Hbar_s):
+    a_raw, b_raw = params_ab
+    alpha, beta = alpha_beta_from_ab(a_raw, b_raw)
+
+    # very small guard: if alpha+beta extremely close to 1, recursion can get unstable
+    # (mapping guarantees <1, but numerically might get very close)
+    # if alpha + beta >= 0.999999999:
+    #     return np.inf
+
+    T, N = y_b.shape
+    H = Hbar_s.copy()
+    nll = 0.0
+
+    # local refs for speed
+    one_minus = (1.0 - alpha - beta)
     for t in range(T):
-        Sig_t = (1 - alpha - beta) * equicorr_sigma + alpha * np.outer(y_prev, y_prev) + beta * Sig_prev
-        y[t] = rng.multivariate_normal(np.zeros(N), Sig_t)
-        y_prev = y[t]
-        Sig_prev = Sig_t
+        y = y_b[t]
+        try:
+            c, lower = cho_factor(H, lower=True, check_finite=False)
+        except np.linalg.LinAlgError:
+            return np.inf
 
-    return y
+        # log |H| from Cholesky factor
+        logdet = 2.0 * np.sum(np.log(np.diag(c)))
 
-y_simulated = np.zeros((B, T, N))
-S_simulated_no_shrinkage = np.zeros((B, N, N))
-lam_simulated_no_shrinkage = np.zeros((B, N))
-S_simulated_shrinkage = np.zeros((B, N, N))
-lam_simulated_shrinkage = np.zeros((B, N))
-S_simulated_oracle = np.zeros((B, N, N))
-lam_simulated_oracle = np.zeros((B, N))
+        # quad = y' H^{-1} y using cho_solve
+        Hy = cho_solve((c, lower), y, check_finite=False)
+        quad = float(y @ Hy)
 
-## Monte Carlo loop with and without shrinkage
-for b in range(B):
-    y_simulated[b] = simulate_bekk_vec(T, alpha, beta, rng)
-    mean = y_simulated[b].mean(axis=0)
+        nll += 0.5 * (logdet + quad)
 
-    # Sample covariance S = (1/T) (y-mean)'(y-mean)
-    y_simulated_demeaned = y_simulated[b] - mean
-    S = (y_simulated_demeaned.T @ y_simulated_demeaned) / T
+        # Update for next step (skip after last obs)
+        if t < T - 1:
+            H = one_minus * Hbar_s + alpha * yy[t] + beta * H
 
-    # --- CHANGE: compute eigenvalues + eigenvectors for S ---
-    lam, U = np.linalg.eigh(S)  # lam ascending, U columns are eigenvectors
+    return nll
 
-    S_simulated_no_shrinkage[b] = S
-    lam_simulated_no_shrinkage[b] = lam
 
-    # Shrinkage (unchanged)
-    Sigma_hat = cov1Para(pd.DataFrame(y_simulated[b]), k=None)
-    lam_shrunk = np.linalg.eigvalsh(Sigma_hat)
-    S_simulated_shrinkage[b] = Sigma_hat
-    lam_simulated_shrinkage[b] = lam_shrunk
+# ============================================================
+# 3) Estimate (alpha,beta) for one simulation b, separately for each strategy s
+#    Key speed-ups:
+#      - compute yy ONCE here per replication b
+#      - reuse y_b and Hbar_b slices
+# ============================================================
+def estimate_one_b_separate(b, y_simulated, init_H_generic, x0_ab, method, options):
+    y_b = y_simulated[b]          # (T,N)
+    Hbar_b = init_H_generic[b]    # (3,N,N)
+    T, N = y_b.shape
 
-    # --- CHANGE: Oracle eigenvalues + oracle covariance via eigenvectors ---
-    lam_simulated_oracle[b, :-1] = np.mean(lam[:-1])
-    lam_simulated_oracle[b, -1]  = lam[-1]
-    S_simulated_oracle[b, :, :]  = U @ np.diag(lam_simulated_oracle[b, :]) @ U.T
+    # Precompute yy_t = y_t y_t' once per replication b
+    # (This was previously inside the objective and recomputed many times)
+    yy = np.einsum("tn,tm->tnm", y_b, y_b, optimize=True)  # (T,N,N)
 
-lam_simulated_no_shrinkage_avg = lam_simulated_no_shrinkage.mean(axis=0)
-lam_simulated_shrinkage_avg = lam_simulated_shrinkage.mean(axis=0)
-lam_simulated_oracle_avg = lam_simulated_oracle.mean(axis=0)
+    ab_hat = np.zeros((3, 2))
+    alpha_hat = np.zeros(3)
+    beta_hat  = np.zeros(3)
+    nll_hat   = np.zeros(3)
+    success   = np.zeros(3, dtype=bool)
+    messages  = [""] * 3
 
-fig = plt.figure()
-plt.plot(np.arange(1, N + 1), lam_simulated_no_shrinkage_avg, marker="o", linestyle="--",
-         label="Average non-shrunk eigenvalues", color="skyblue")
-plt.plot(np.arange(1, N + 1), lam_simulated_shrinkage_avg, marker="+", linestyle="-",
-         label="Average linearly shrunk eigenvalues", color="green")
-plt.plot(np.arange(1, N + 1), lam_simulated_oracle_avg, marker="x", linestyle="--",
-         label="Oracle eigenvalues", color="darkorange")
-plt.xlabel("Eigenvalue index i (sorted)")
-plt.ylabel("Eigenvalue, log scale")
-plt.yscale("log")
-plt.legend()
-plt.title(f"Eigenvalues BEKK/VEC: N={N}, T={T}, rho={rho}, B={B}")
-plt.show()
-out_path = output_path_pic / "A2_Fig4.png"
-fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    for s in range(3):
+        Hbar_s = Hbar_b[s]
+        obj = lambda p, yb=y_b, yyt=yy, Hb=Hbar_s: neg_loglik_one_b_one_s(p, yb, yyt, Hb)
+        res = minimize(obj, x0=np.asarray(x0_ab, dtype=float), method=method, options=options)
 
-no_shrunk_estimated_sigma = np.mean(S_simulated_no_shrinkage, axis=0)
-linear_shrunk_estimated_sigma = np.mean(S_simulated_shrinkage, axis=0)
-oracle_estimated_sigma = np.mean(S_simulated_oracle, axis=0)
+        ab_hat[s] = res.x
+        a_s, b_s = alpha_beta_from_ab(res.x[0], res.x[1])
+        alpha_hat[s] = a_s
+        beta_hat[s]  = b_s
+        nll_hat[s]   = res.fun
+        success[s]   = res.success
+        messages[s]  = str(res.message)
 
-def cut_with_dots(A, k=6):
-    assert k == 6
-    n = A.shape[0]
-    idx = [0, 1, 2, 3, n-2, n-1]
+    return ab_hat, alpha_hat, beta_hat, nll_hat, success, messages
 
-    B = np.empty((k, k), dtype=object)
-    for i, ii in enumerate(idx):
-        for j, jj in enumerate(idx):
-            B[i, j] = A[ii, jj]
 
-    for j in range(k):
-        B[4, j] = r"\vdots"
-    for i in range(k):
-        B[i, 4] = r"\cdots"
-    B[4, 4] = r"\ddots"
-    return B
+# ============================================================
+# 4) Parallel Monte Carlo estimation: B simulations
+#    Key speed-ups:
+#      - switch to backend="threading" (often better with heavy BLAS/LAPACK)
+#      - limit BLAS threads to 1 per worker to avoid oversubscription
+# ============================================================
+def estimate_ab_separate_per_strategy_parallel(
+    y_simulated,
+    init_H_no_shrink,
+    init_H_linear,
+    init_H_oracle,
+    x0_ab=(0.0, 0.0),
+    method="L-BFGS-B",
+    options=None,
+    n_jobs=-1,
+    backend="threading",     # changed from "loky"
+    blas_threads=1           # avoid oversubscription
+):
+    B, T, N = y_simulated.shape
+    init_H_generic = build_init_H_generic(B, N, init_H_no_shrink, init_H_linear, init_H_oracle)
 
-def to_latex_table(B, floatfmt="{:.4f}"):
-    def fmt(x):
-        if isinstance(x, (float, int, np.floating, np.integer)):
-            return floatfmt.format(float(x))
-        return x
+    if options is None:
+        options = {"maxiter": 20}   
 
-    df = pd.DataFrame([[fmt(x) for x in row] for row in B])
-    return df.to_latex(index=False, header=False, escape=False, column_format="r"*df.shape[1])
+    # Limit BLAS/LAPACK threads inside the parallel region
+    # (prevents each Cholesky from using many threads simultaneously)
+    with threadpool_limits(limits=blas_threads):
+        results = Parallel(n_jobs=n_jobs, backend=backend, prefer="threads")(
+            delayed(estimate_one_b_separate)(b, y_simulated, init_H_generic, x0_ab, method, options)
+            for b in range(B)
+        )
 
-# build cut tables
-B_no     = cut_with_dots(no_shrunk_estimated_sigma)
-B_linear = cut_with_dots(linear_shrunk_estimated_sigma)
-B_oracle = cut_with_dots(oracle_estimated_sigma)
+    ab_hat    = np.stack([r[0] for r in results], axis=0)  # (B,3,2)
+    alpha_hat = np.stack([r[1] for r in results], axis=0)  # (B,3)
+    beta_hat  = np.stack([r[2] for r in results], axis=0)  # (B,3)
+    nll_hat   = np.stack([r[3] for r in results], axis=0)  # (B,3)
+    success   = np.stack([r[4] for r in results], axis=0)  # (B,3)
+    messages  = [r[5] for r in results]
 
-# save each as its own .tex
-(output_path_tables / "sigma_no_cut.tex").write_text(to_latex_table(B_no), encoding="utf-8")
-(output_path_tables / "sigma_lin_cut.tex").write_text(to_latex_table(B_linear), encoding="utf-8")
-(output_path_tables / "sigma_or_cut.tex").write_text(to_latex_table(B_oracle), encoding="utf-8")
+    summary = {
+        "success_rate": success.mean(axis=0),
+        "alpha_mean": alpha_hat.mean(axis=0),
+        "alpha_sd": alpha_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
+        "beta_mean": beta_hat.mean(axis=0),
+        "beta_sd": beta_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
+        "nll_mean": nll_hat.mean(axis=0),
+        "nll_sd": nll_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
+    }
 
-print("Saved to:", output_path_tables.resolve())
+    return ab_hat, alpha_hat, beta_hat, nll_hat, success, messages, summary
 
 # ============================================================
 # 1) Transform: (a,b) -> (alpha,beta) with alpha,beta >= 0 and alpha+beta < 1
@@ -535,8 +580,8 @@ ab_hat, alpha_hat, beta_hat, nll_hat, success, messages, summary = estimate_ab_s
 #
 print("alpha mean:", summary["alpha_mean"])
 print("beta  mean:", summary["beta_mean"])
-print("alpha se:", summary["alpha_sd"]/np.sqrt(B))
-print("beta  se:", summary["beta_sd"]/np.sqrt(B))
+print("alpha sd:", summary["alpha_sd"])
+print("beta  sd:", summary["beta_sd"])
 
 # Build table where each cell shows mean on top and SE in parentheses below
 rows = []
@@ -637,3 +682,406 @@ df_portfolio = pd.DataFrame(rows)
 latex_table_portfolio = df_portfolio.to_latex(index=False, escape=False)
 (output_path_tables / "portfolio_performance_summary.tex").write_text(latex_table_portfolio, encoding="utf-8")
 print("Saved portfolio performance summary to:", (output_path_tables / "portfolio_performance_summary.tex").resolve())
+
+"""
+Q1.4 — fully parameterized experiment runner (COMPLETE, CONSISTENT)
+WITH improved LaTeX export:
+- centered table + caption
+- tighter horizontal spacing (tabcolsep)
+- increased row spacing (arraystretch)
+- midrules between methods (like your manual lines)
+- SEs only for Alpha/Beta; portfolio columns are means only (no SEs)
+"""
+# =============================
+# Helpers
+# =============================
+def make_equicorr_sigma(N, rho):
+    I = np.eye(N)
+    one = np.ones((N, 1))
+    return (1 - rho) * I + rho * (one @ one.T)
+
+def simulate_bekk_vec(T, alpha, beta, Sigma_bar, rng):
+    N = Sigma_bar.shape[0]
+    y = np.zeros((T, N))
+
+    Sigma_t = Sigma_bar.copy()   # Sigma_1
+    y_prev = np.zeros(N)         # y_0 = 0 so Sigma_1 = Sigma_bar
+
+    for t in range(T):
+        # draw y_t | F_{t-1} ~ N(0, Sigma_t)
+        y[t] = rng.multivariate_normal(np.zeros(N), Sigma_t)
+
+        # update Sigma_{t+1}
+        Sigma_t = (1 - alpha - beta) * Sigma_bar \
+                  + alpha * np.outer(y[t], y[t]) \
+                  + beta * Sigma_t
+
+    return y
+
+
+def sample_cov_1_over_T(y):
+    y_d = y - y.mean(axis=0)
+    return (y_d.T @ y_d) / y.shape[0]  # 1/T
+
+def oracle_cov_equicorr_pooling(S):
+    lam, U = np.linalg.eigh(S)  # ascending
+    lam_or = lam.copy()
+    lam_or[:-1] = lam[:-1].mean()
+    return U @ np.diag(lam_or) @ U.T
+
+def alpha_beta_from_ab(a, b):
+    """
+    Map unconstrained (a,b) to (alpha,beta) with alpha,beta>=0 and alpha+beta<1
+    """
+    ea, eb = np.exp(a), np.exp(b)
+    den = 1.0 + ea + eb
+    alpha = ea / den
+    beta  = eb / den
+    return alpha, beta
+
+def neg_loglik_one(params_ab, y_b, Sigma_bar):
+    """
+    Gaussian QML objective (constants dropped):
+      sum_t 0.5 * (log|Sigma_t| + y_t' Sigma_t^{-1} y_t)
+    with recursion:
+      Sigma_{t+1} = (1-a-b)Sigma_bar + a y_t y_t' + b Sigma_t
+    """
+    a_raw, b_raw = params_ab
+    alpha, beta = alpha_beta_from_ab(a_raw, b_raw)
+
+    T, N = y_b.shape
+    Sigma_t = Sigma_bar.copy()
+    nll = 0.0
+
+    for t in range(T):
+        y = y_b[t]
+        try:
+            L = cholesky(Sigma_t, lower=True, check_finite=False)
+        except np.linalg.LinAlgError:
+            return np.inf
+
+        logdet = 2.0 * np.sum(np.log(np.diag(L)))
+        z = solve_triangular(L, y, lower=True, check_finite=False)
+        quad = float(np.dot(z, z))
+        nll += 0.5 * (logdet + quad)
+
+        Sigma_t = (1.0 - alpha - beta) * Sigma_bar + alpha * np.outer(y, y) + beta * Sigma_t
+
+    return nll
+
+def estimate_one_replication_three_strategies(b, y_simulated, Sigma_bar_all_b, x0_ab, method, options):
+    """
+    One replication b:
+      estimate alpha/beta separately for 3 strategies (Sigma_bar fixed per strategy)
+    """
+    y_b = y_simulated[b]
+    ab_hat = np.zeros((3, 2))
+    alpha_hat = np.zeros(3)
+    beta_hat  = np.zeros(3)
+    nll_hat   = np.zeros(3)
+    success   = np.zeros(3, dtype=bool)
+
+    for s in range(3):
+        Sigma_bar = Sigma_bar_all_b[s]
+        obj = lambda p: neg_loglik_one(p, y_b, Sigma_bar)
+        res = minimize(obj, x0=np.asarray(x0_ab, dtype=float), method=method, options=options)
+
+        ab_hat[s] = res.x
+        a_s, b_s = alpha_beta_from_ab(res.x[0], res.x[1])
+        alpha_hat[s] = a_s
+        beta_hat[s]  = b_s
+        nll_hat[s]   = res.fun
+        success[s]   = res.success
+
+    return ab_hat, alpha_hat, beta_hat, nll_hat, success
+
+def estimate_qml_parallel(y_simulated, Sigma_bar_all, alpha0, beta0, method="L-BFGS-B", options=None, n_jobs=-1):
+    """
+    y_simulated: (B,T,N)
+    Sigma_bar_all: (B,3,N,N)
+    """
+    c0 = 1 - alpha0 - beta0
+    x0_ab = (np.log(alpha0/c0), np.log(beta0/c0))
+    
+    if options is None:
+        options = {"maxiter": 50}
+
+    B = y_simulated.shape[0]
+    results = Parallel(n_jobs=n_jobs, backend="loky")(
+        delayed(estimate_one_replication_three_strategies)(
+            b, y_simulated, Sigma_bar_all[b], x0_ab, method, options
+        )
+        for b in range(B)
+    )
+
+    ab_hat    = np.stack([r[0] for r in results], axis=0)  # (B,3,2)
+    alpha_hat = np.stack([r[1] for r in results], axis=0)  # (B,3)
+    beta_hat  = np.stack([r[2] for r in results], axis=0)  # (B,3)
+    nll_hat   = np.stack([r[3] for r in results], axis=0)  # (B,3)
+    success   = np.stack([r[4] for r in results], axis=0)  # (B,3)
+
+    summary = {
+        "success_rate": success.mean(axis=0),
+        "alpha_mean": alpha_hat.mean(axis=0),
+        "alpha_sd": alpha_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
+        "beta_mean": beta_hat.mean(axis=0),
+        "beta_sd": beta_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
+        "nll_mean": nll_hat.mean(axis=0),
+        "nll_sd": nll_hat.std(axis=0, ddof=1) if B > 1 else np.zeros(3),
+    }
+    return ab_hat, alpha_hat, beta_hat, nll_hat, success, summary
+
+def min_var_weights(cov_matrix, jitter=1e-8, use_pin=False):
+    """
+    w = Sigma^{-1}1 / (1' Sigma^{-1} 1) via Cholesky solves for stability (no explicit inverse)
+    If Sigma is not positive definite, either use pseudoinverse or add tiny jitter and retry
+    """
+    n = cov_matrix.shape[0]
+    ones = np.ones(n)
+    try:
+        L = cholesky(cov_matrix, lower=True, check_finite=False)
+    except np.linalg.LinAlgError:
+        if use_pin:
+            pinv = np.linalg.pinv(cov_matrix)
+            x = pinv @ ones
+            return x / (ones @ x)
+        cov_matrix = cov_matrix + jitter * np.eye(n)
+        L = cholesky(cov_matrix, lower=True, check_finite=False)
+
+    y = solve_triangular(L, ones, lower=True, check_finite=False)
+    x = solve_triangular(L.T, y, lower=False, check_finite=False)
+    return x / (ones @ x)
+
+def portfolio_stats_per_replication(y_simulated, Sigma_bar_all, alpha_hat, beta_hat):
+    """
+    For each replication b and method s:
+      - filter Sigma_t
+      - compute min-var portfolio returns r_t = w_t' y_t
+      - compute mean_t(r) and var_t(r)
+    Then return averages over b (means only; NO SEs)
+    """
+    B, T, N = y_simulated.shape
+    port_mean_b = np.zeros((B, 3))
+    port_var_b  = np.zeros((B, 3))
+
+    for b in range(B):
+        y_b = y_simulated[b]
+        for s in range(3):
+            Sigma_bar = Sigma_bar_all[b, s]
+            a_hat = alpha_hat[b, s]
+            b_hat = beta_hat[b, s]
+
+            Sigma_t = Sigma_bar.copy()
+            r = np.zeros(T)
+
+            for t in range(T):
+                w = min_var_weights(Sigma_t)
+                r[t] = float(w @ y_b[t])
+                Sigma_t = (1.0 - a_hat - b_hat) * Sigma_bar + a_hat * np.outer(y_b[t], y_b[t]) + b_hat * Sigma_t
+
+            port_mean_b[b, s] = r.mean()
+            port_var_b[b, s]  = r.var(ddof=1)
+
+    return {
+        "mean_mean": port_mean_b.mean(axis=0),
+        "var_mean":  port_var_b.mean(axis=0),
+    }
+
+# =============================
+# Main runner (ONE grid point)
+# =============================
+def run_q14_experiment(
+    N, T, B,
+    rho=0.5,
+    alpha_true = 0.93, beta_true=0.05,
+    seed=1827,
+    qml_maxiter=200,
+    n_jobs=-1,
+):
+    rng = np.random.default_rng(seed)
+    Sigma_true = make_equicorr_sigma(N, rho)
+
+    # 1) Simulate B replications
+    y_sim = np.zeros((B, T, N))
+    for b in range(B):
+        y_sim[b] = simulate_bekk_vec(T, alpha_true, beta_true, Sigma_true, rng)
+
+    # 2) Replication-specific unconditional Sigmas
+    Sigma_bar_all = np.zeros((B, 3, N, N))
+    for b in range(B):
+        S_b = sample_cov_1_over_T(y_sim[b])
+        Sigma_bar_all[b, 0] = S_b
+        Sigma_bar_all[b, 1] = cov1Para(pd.DataFrame(y_sim[b]), k=None)  
+        Sigma_bar_all[b, 2] = oracle_cov_equicorr_pooling(S_b)
+
+    # 3) QML estimation (alpha/beta) per replication, per method
+    ab_hat, alpha_hat, beta_hat, nll_hat, success, qml_summary = estimate_qml_parallel(
+        y_simulated=y_sim,
+        Sigma_bar_all=Sigma_bar_all,
+        alpha0=alpha_true, beta0=beta_true,
+        method="L-BFGS-B",
+        options={"maxiter": qml_maxiter},
+        n_jobs=n_jobs
+    )
+
+    # 4) Portfolio performance (means only)
+    port_summary = portfolio_stats_per_replication(y_sim, Sigma_bar_all, alpha_hat, beta_hat)
+
+    return {
+        "N": N, "T": T, "B": B, "rho": rho, "alpha_true": alpha_true, "beta_true": beta_true, "seed": seed,
+        "qml": qml_summary,
+        "portfolio": port_summary,
+        "success": success,
+    }
+
+# =============================
+# Table writing (ONE table per grid point) — UPDATED EXPORT STYLE
+# =============================
+def cell_with_se(mean, se, fmt_mean="{:.4f}", fmt_se="{:.4f}"):
+    return rf"\shortstack[l]{{{fmt_mean.format(mean)} \\ ({fmt_se.format(se)})}}"
+
+def cell_plain(x, fmt="{:.6f}"):
+    return fmt.format(x)
+
+def save_one_grid_table(
+    res,
+    outdir: Path,
+    tag_prefix="q14",
+    tabcolsep_pt=3,          
+    arraystretch=1.25,       
+    add_midrules=True,
+    center_caption_and_table=True
+):
+    """
+    Saves ONE LaTeX table for that (N,T,B)
+    Columns:
+      Alpha (mean + SE), Beta (mean + SE), Mean return (mean only), Var return (mean only)
+
+    Extras:
+      - centered table + caption
+      - tighter spacing with tabcolsep
+      - midrules between methods
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    N, T, B = res["N"], res["T"], res["B"]
+    q = res["qml"]
+    p = res["portfolio"]
+
+    strategies = ["No Shrinkage", "Linear Shrinkage", "Oracle"]
+
+    rows = []
+    for s_idx, s_name in enumerate(strategies):
+        alpha_mean = q["alpha_mean"][s_idx]
+        alpha_sd   = q["alpha_sd"][s_idx]  if B > 1 else 0.0
+
+        beta_mean  = q["beta_mean"][s_idx]
+        beta_sd    = q["beta_sd"][s_idx]  if B > 1 else 0.0
+
+        mean_ret = p["mean_mean"][s_idx]
+        var_ret  = p["var_mean"][s_idx]
+
+        rows.append({
+            "Method": s_name,
+            "Alpha": cell_with_se(alpha_mean, alpha_sd, "{:.4f}", "{:.4f}"),
+            "Beta":  cell_with_se(beta_mean,  beta_sd,  "{:.4f}", "{:.4f}"),
+            "Mean return": cell_plain(mean_ret, "{:.6f}"),
+            "Var return":  cell_plain(var_ret,  "{:.6f}"),
+        })
+
+    df = pd.DataFrame(rows)
+
+    caption = f"Q1.4 results (N={N}, T={T}, B={B})"
+    label = f"tab:{tag_prefix}_N{N}_T{T}_B{B}"
+
+    tex = df.to_latex(
+        index=False,
+        escape=False,
+        caption=caption,
+        label=label,
+        column_format="lcccc"
+    )
+
+    # ---- Post-process: centering + spacing ----
+    if center_caption_and_table:
+        # center the tabular
+        if "\\begin{table}\n\\centering" not in tex:
+            tex = tex.replace("\\begin{table}", "\\begin{table}\n\\centering", 1)
+        # force caption centering even under classes that left-align captions
+        tex = re.sub(r"\\caption\{", r"\\caption{\\centering ", tex, count=1)
+
+    # tighter columns + nicer row spacing
+    tex = tex.replace(
+        "\\begin{table}",
+        "\\begin{table}\n"
+        f"\\setlength\\tabcolsep{{{tabcolsep_pt}pt}}\n"
+        f"\\renewcommand{{\\arraystretch}}{{{arraystretch}}}",
+        1
+    )
+
+    # ---- Post-process: add midrules between method rows ----
+    if add_midrules:
+        m = re.search(r"(\\midrule\s*\n)(.*?)(\\bottomrule)", tex, flags=re.S)
+        if m:
+            header_mid = m.group(1)
+            body = m.group(2)
+            bottom = m.group(3)
+
+            lines = body.splitlines()
+            new_lines = []
+            for line in lines:
+                new_lines.append(line)
+                if line.strip().endswith(r"\\"):
+                    new_lines.append(r"\midrule")
+            body2 = "\n".join(new_lines) + "\n"
+
+            tex = tex[:m.start()] + header_mid + body2 + bottom + tex[m.end():]
+            # remove an extra midrule right before bottomrule, if inserted
+            tex = tex.replace("\\midrule\n\\bottomrule", "\\bottomrule")
+
+    outpath = outdir / f"{tag_prefix}_N{N}_T{T}_B{B}.tex"
+    outpath.write_text(tex, encoding="utf-8")
+    return outpath
+
+# RUN THE GRID
+grid = [
+    {"N": 20, "T": 100, "B": 500},
+    {"N": 50, "T": 100, "B": 500},
+    {"N": 20, "T": 200, "B": 500},
+    {"N": 50, "T": 200, "B": 500},
+    {"N": 20, "T": 1000, "B": 500},
+    {"N": 50, "T": 1000, "B": 500}
+]
+
+saved_paths = []
+
+for g in grid:
+    res = run_q14_experiment(
+        N=g["N"], T=g["T"], B=g["B"],
+        rho=0.5,
+        alpha_true=0.05, beta_true=0.93,
+        seed=1827,
+        qml_maxiter=200,
+        n_jobs=-1
+    )
+
+    print(f"Done N={g['N']} T={g['T']} B={g['B']}")
+    print("  alpha means:", res["qml"]["alpha_mean"])
+    print("  beta  means:", res["qml"]["beta_mean"])
+    print("  success rates:", res["qml"]["success_rate"])
+
+    outpath = save_one_grid_table(
+        res,
+        outdir=output_path_tables,
+        tag_prefix="q14",
+        tabcolsep_pt=3,       
+        arraystretch=1.25,    
+        add_midrules=True,
+        center_caption_and_table=True
+    )
+    saved_paths.append(outpath)
+    print("  saved table:", outpath)
+
+print("All saved tables:")
+for p in saved_paths:
+    print(" ", p)
