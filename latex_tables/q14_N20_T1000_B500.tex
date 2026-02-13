@@ -1,0 +1,18 @@
+\begin{table}
+\setlength\tabcolsep{3pt}
+\renewcommand{\arraystretch}{1.25}
+\centering
+\caption{\centering Q1.4 results (N=20, T=1000, B=500)}
+\label{tab:q14_N20_T1000_B500}
+\begin{tabular}{lcccc}
+\toprule
+Method & Alpha & Beta & Mean return & Var return \\
+\midrule
+No Shrinkage & \shortstack[l]{0.0457 \\ (0.0014)} & \shortstack[l]{0.9311 \\ (0.0021)} & 0.001974 & 0.309249 \\
+\midrule
+Linear Shrinkage & \shortstack[l]{0.0460 \\ (0.0015)} & \shortstack[l]{0.9309 \\ (0.0021)} & 0.001965 & 0.308970 \\
+\midrule
+Oracle & \shortstack[l]{0.0494 \\ (0.0018)} & \shortstack[l]{0.9304 \\ (0.0020)} & 0.001917 & 0.307114 \\
+\bottomrule
+\end{tabular}
+\end{table}
