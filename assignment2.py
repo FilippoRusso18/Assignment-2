@@ -922,7 +922,6 @@ save_latex_table(latex_code, output_path_tables, filename="qml_garch_results.tex
 
 ## Q2.3 - 2.4
 
-
 #data constriction for HAR model
 
 dates = rv["Date"].values
@@ -1009,19 +1008,21 @@ def fit_eval_one_sample(D, label, save_prefix):
     print("   RF: MSE =", mse_rf,  "| MAE =", mae_rf,  "| mean error =", me_rf)
 
 
-    metrics = pd.DataFrame({
-        "Sample": [label],
-        "N_total": [N],
-        "Train": [len(train)],
-        "Test": [len(test)],
-        "OLS_MSE": [mse_ols],
-        "OLS_MAE": [mae_ols],
-        "OLS_mean_error": [me_ols],
-        "RF_MSE": [mse_rf],
-        "RF_MAE": [mae_rf],
-        "RF_mean_error": [me_rf],
-    })
+    metrics = pd.DataFrame(
+    {
+        "OLS (log-HAR)": [mse_ols, mae_ols, me_ols],
+        "Random Forest": [mse_rf,  mae_rf,  me_rf],
+    },
+    index=["MSE", "MAE", "Mean error"]
+)
 
+    metrics.loc["N total"] = [N, N]
+    metrics.loc["Train"]   = [len(train), len(train)]
+    metrics.loc["Test"]    = [len(test), len(test)]
+
+    # if you want the info at the top (nicer):
+    metrics = metrics.loc[["N total","Train","Test","MSE","MAE","Mean error"]]
+    
     # latex table
     latex_path = output_path_tables / f"{save_prefix}_metrics.tex"
     metrics.to_latex(latex_path, index=False, float_format="%.6f")
@@ -1126,7 +1127,6 @@ def ols_two_model_latex(ols_a, ols_b, colnames=("Full sample", "Latest 10y"),
 
     tab = pd.concat([tab, stats], axis=0)
     return tab
-
 #entire sample
 metrics_full, preds_full, ols_full, rf_full = fit_eval_one_sample(
     D_full,
@@ -1145,7 +1145,7 @@ metrics_10y, preds_10y, ols_10y, rf_10y = fit_eval_one_sample(
     save_prefix="rv_forecast_latest_10y"
 )
 
-ols_tab = ols_two_model_latex( #comparison of the OLS estimates for the two sets of data
+ols_tab = ols_two_model_latex(
     ols_full, ols_10y,
     colnames=("Full sample", "Latest 10 years")
 )
@@ -1153,10 +1153,17 @@ ols_tab = ols_two_model_latex( #comparison of the OLS estimates for the two sets
 latex_path = output_path_tables / "ols_har_full_vs_10y.tex"
 ols_tab.to_latex(
     latex_path,
-    escape=False,         
+    escape=False,          # allow math in labels
     header=True,
     index=True
 )
+combined = pd.concat(
+    {"Full sample": metrics_full, "Latest 10 years": metrics_10y},
+    axis=0
+)
 
+latex_path = output_path_tables / "har_metrics_full_vs_10y.tex"
+combined.to_latex(latex_path, float_format="%.6f", escape=False)
 print(ols_tab)
 print("Saved:", latex_path)
+
