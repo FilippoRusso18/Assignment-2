@@ -711,7 +711,7 @@ def fit_garch(r):
 
 
 def fit_aug_garch(r, RV):
-    # ---- starting guesses
+    # starting guesses
     mu0 = r.mean()
     omega0 = 0.05 * np.var(r)
     alpha0 = 0.05
@@ -719,7 +719,7 @@ def fit_aug_garch(r, RV):
     gamma0 = 0.80
     theta0 = np.array([mu0, omega0, alpha0, beta0, gamma0])
 
-    #impose gamma >= 0 because RV is a variance measure and
+    
     bounds = [
         (None, None),   # mu
         (1e-9, None),   # omega
