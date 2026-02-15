@@ -1,10 +1,10 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import math
 from pathlib import Path
 from scipy import stats
+
 from numpy.linalg import inv, LinAlgError
 from scipy.linalg import cholesky, solve_triangular, cho_factor, cho_solve
 from scipy.optimize import minimize
@@ -13,6 +13,9 @@ import re
 import os
 from threadpoolctl import threadpool_limits
 
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools.tools import add_constant
+from sklearn.ensemble import RandomForestRegressor
 
 
 output_path_pic = Path(r"C:\Users\fipli\OneDrive - UvA\TI Master content\2.3 Advanced Time Series Econometrics\Assignment 2\Pictures Assignment 2")
@@ -279,12 +282,6 @@ def alpha_beta_from_ab(a, b):
     return alpha, beta
 
 def neg_loglik_one(params_ab, y_b, Sigma_bar):
-    """
-    Gaussian QML objective (constants dropped):
-      sum_t 0.5 * (log|Sigma_t| + y_t' Sigma_t^{-1} y_t)
-    with recursion:
-      Sigma_{t+1} = (1-a-b)Sigma_bar + a y_t y_t' + b Sigma_t
-    """
     a_raw, b_raw = params_ab
     alpha, beta = alpha_beta_from_ab(a_raw, b_raw)
 
@@ -309,10 +306,6 @@ def neg_loglik_one(params_ab, y_b, Sigma_bar):
     return nll
 
 def estimate_one_replication_three_strategies(b, y_simulated, Sigma_bar_all_b, x0_ab, method, options):
-    """
-    One replication b:
-      estimate alpha/beta separately for 3 strategies (Sigma_bar fixed per strategy)
-    """
     y_b = y_simulated[b]
     ab_hat = np.zeros((3, 2))
     alpha_hat = np.zeros(3)
@@ -335,10 +328,6 @@ def estimate_one_replication_three_strategies(b, y_simulated, Sigma_bar_all_b, x
     return ab_hat, alpha_hat, beta_hat, nll_hat, success
 
 def estimate_qml_parallel(y_simulated, Sigma_bar_all, alpha0, beta0, method="L-BFGS-B", options=None, n_jobs=-1):
-    """
-    y_simulated: (B,T,N)
-    Sigma_bar_all: (B,3,N,N)
-    """
     c0 = 1 - alpha0 - beta0
     x0_ab = (np.log(alpha0/c0), np.log(beta0/c0))
     
@@ -353,11 +342,11 @@ def estimate_qml_parallel(y_simulated, Sigma_bar_all, alpha0, beta0, method="L-B
         for b in range(B)
     )
 
-    ab_hat    = np.stack([r[0] for r in results], axis=0)  # (B,3,2)
-    alpha_hat = np.stack([r[1] for r in results], axis=0)  # (B,3)
-    beta_hat  = np.stack([r[2] for r in results], axis=0)  # (B,3)
-    nll_hat   = np.stack([r[3] for r in results], axis=0)  # (B,3)
-    success   = np.stack([r[4] for r in results], axis=0)  # (B,3)
+    ab_hat    = np.stack([r[0] for r in results], axis=0)  
+    alpha_hat = np.stack([r[1] for r in results], axis=0)  
+    beta_hat  = np.stack([r[2] for r in results], axis=0)  
+    nll_hat   = np.stack([r[3] for r in results], axis=0)  
+    success   = np.stack([r[4] for r in results], axis=0)  
 
     summary = {
         "success_rate": success.mean(axis=0),
@@ -371,10 +360,6 @@ def estimate_qml_parallel(y_simulated, Sigma_bar_all, alpha0, beta0, method="L-B
     return ab_hat, alpha_hat, beta_hat, nll_hat, success, summary
 
 def min_var_weights(cov_matrix, jitter=1e-8, use_pin=False):
-    """
-    w = Sigma^{-1}1 / (1' Sigma^{-1} 1) via Cholesky solves for stability (no explicit inverse)
-    If Sigma is not positive definite, either use pseudoinverse or add tiny jitter and retry
-    """
     n = cov_matrix.shape[0]
     ones = np.ones(n)
     try:
@@ -392,13 +377,6 @@ def min_var_weights(cov_matrix, jitter=1e-8, use_pin=False):
     return x / (ones @ x)
 
 def portfolio_stats_per_replication(y_simulated, Sigma_bar_all, alpha_hat, beta_hat):
-    """
-    For each replication b and method s:
-      - filter Sigma_t
-      - compute min-var portfolio returns r_t = w_t' y_t
-      - compute mean_t(r) and var_t(r)
-    Then return averages over b (means only; NO SEs)
-    """
     B, T, N = y_simulated.shape
     port_mean_b = np.zeros((B, 3))
     port_var_b  = np.zeros((B, 3))
@@ -426,9 +404,8 @@ def portfolio_stats_per_replication(y_simulated, Sigma_bar_all, alpha_hat, beta_
         "var_mean":  port_var_b.mean(axis=0),
     }
 
-# =============================
-# Main runner (ONE grid point)
-# =============================
+
+# Main function to run the full experiment for Q1.4, returning all results in a dictionary (the last two points of the grid require half an hour to run with B=1000, so I added n_jobs for parallelization and set it to -1 by default to use all cores)
 def run_q14_experiment(
     N, T, B,
     rho=0.5,
@@ -473,9 +450,7 @@ def run_q14_experiment(
         "success": success,
     }
 
-# =============================
-# Table writing (ONE table per grid point) — UPDATED EXPORT STYLE
-# =============================
+#export the data to latex tables, with the following formatting functions for the cells (with mean and se, or plain)
 def cell_with_se(mean, se, fmt_mean="{:.4f}", fmt_se="{:.4f}"):
     return rf"\shortstack[l]{{{fmt_mean.format(mean)} \\ ({fmt_se.format(se)})}}"
 
@@ -491,16 +466,7 @@ def save_one_grid_table(
     add_midrules=True,
     center_caption_and_table=True
 ):
-    """
-    Saves ONE LaTeX table for that (N,T,B)
-    Columns:
-      Alpha (mean + SE), Beta (mean + SE), Mean return (mean only), Var return (mean only)
 
-    Extras:
-      - centered table + caption
-      - tighter spacing with tabcolsep
-      - midrules between methods
-    """
     outdir.mkdir(parents=True, exist_ok=True)
 
     N, T, B = res["N"], res["T"], res["B"]
@@ -541,7 +507,6 @@ def save_one_grid_table(
         column_format="lcccc"
     )
 
-    # ---- Post-process: centering + spacing ----
     if center_caption_and_table:
         # center the tabular
         if "\\begin{table}\n\\centering" not in tex:
@@ -549,7 +514,7 @@ def save_one_grid_table(
         # force caption centering even under classes that left-align captions
         tex = re.sub(r"\\caption\{", r"\\caption{\\centering ", tex, count=1)
 
-    # tighter columns + nicer row spacing
+
     tex = tex.replace(
         "\\begin{table}",
         "\\begin{table}\n"
@@ -558,7 +523,6 @@ def save_one_grid_table(
         1
     )
 
-    # ---- Post-process: add midrules between method rows ----
     if add_midrules:
         m = re.search(r"(\\midrule\s*\n)(.*?)(\\bottomrule)", tex, flags=re.S)
         if m:
@@ -800,10 +764,7 @@ def fit_aug_garch(r, RV):
 
 
 def numerical_hessian(fun, x0, args=(), rel_eps=1e-5):
-    """
-    Central-difference Hessian with parameter-scaled steps.
-    Raises ValueError if non-finite evaluations occur.
-    """
+    
     x0 = np.asarray(x0, float)
     n = x0.size
     H = np.zeros((n, n), float)
@@ -953,15 +914,12 @@ def results_to_latex(res0, res1, T, caption, label):
 
 
 
-
-
 def save_latex_table(latex_code, output_path_tables, filename="qml_garch_results.tex"):
     output_path_tables = Path(output_path_tables)
     output_path_tables.mkdir(parents=True, exist_ok=True)
     out_file = output_path_tables / filename
     out_file.write_text(latex_code, encoding="utf-8")
     print("Saved LaTeX table to:", out_file)
-
 
 
 
@@ -978,3 +936,247 @@ latex_code = results_to_latex(
 )
 
 save_latex_table(latex_code, output_path_tables, filename="qml_garch_results.tex")
+
+# ======================================================================
+# Q2.3
+# ======================================================================
+# ## Q2.3 - 2.4
+
+
+#data constriction for HAR model
+
+dates = rv["Date"].values
+RV    = rv["RV"].values
+logRV = rv["logRV"].values
+
+rows = []
+n = len(dates)
+
+# need t>=21 for 22-day average and t<=n-2 for y=logRV[t+1]
+for t in range(21, n - 1):
+
+    s5 = 0.0
+    for j in range(t - 4, t + 1):
+        s5 += RV[j]
+    RV5 = s5 / 5.0
+
+    s22 = 0.0
+    for j in range(t - 21, t + 1):
+        s22 += RV[j]
+    RV22 = s22 / 22.0
+
+    rows.append({
+        "Date": dates[t],
+        "logRV": logRV[t],
+        "logRV5": np.log(RV5),
+        "logRV22": np.log(RV22),
+        "y": logRV[t + 1]
+    })
+
+D_full = pd.DataFrame(rows).sort_values("Date")
+print("HAR dataset size (usable):", len(D_full))
+
+
+#here I create the function, but I will call it separately for the full sample and the subsample, to get separate tables and plots for each (for your write-up)
+def fit_eval_one_sample(D, label, save_prefix):
+    D = D.sort_values("Date")
+    N = len(D)
+    cut = int(np.floor(0.8 * N))
+    train = D.iloc[:cut]
+    test  = D.iloc[cut:]
+
+    Xcols = ["logRV", "logRV5", "logRV22"]
+    y_tr = train["y"]
+    y_te = test["y"]
+
+    #OLS (LOG HAR)
+    X_tr = add_constant(train[Xcols])
+    X_te = add_constant(test[Xcols], has_constant="add")
+    ols = OLS(y_tr, X_tr).fit()
+    pred_ols = ols.predict(X_te)
+
+    err_ols = (y_te.values - pred_ols.values)
+    mse_ols = float(np.mean(err_ols**2))
+    mae_ols = float(np.mean(np.abs(err_ols)))
+    me_ols  = float(np.mean(err_ols))
+    
+    
+    #Non linear Random Forest
+    rf = RandomForestRegressor(
+        n_estimators=500,
+        random_state=42,
+        min_samples_leaf=5,
+        n_jobs=-1
+    )
+    rf.fit(train[Xcols].values, y_tr.values)
+    pred_rf = rf.predict(test[Xcols].values)
+
+    err_rf = (y_te.values - pred_rf)
+    mse_rf = float(np.mean(err_rf**2))
+    mae_rf = float(np.mean(np.abs(err_rf)))
+    me_rf  = float(np.mean(err_rf))
+
+
+    
+    print("SAMPLE:", label)
+    print("N total:", N, "| Train:", len(train), "| Test:", len(test))
+    print("Date range:", D["Date"].min(), "to", D["Date"].max())
+    print("\nLogHAR (OLS) coefficients:")
+    print(ols.params)
+
+    print("\nTest errors (log RV):")
+    print("  OLS: MSE =", mse_ols, "| MAE =", mae_ols, "| mean error =", me_ols)
+    print("   RF: MSE =", mse_rf,  "| MAE =", mae_rf,  "| mean error =", me_rf)
+
+
+    metrics = pd.DataFrame({
+        "Sample": [label],
+        "N_total": [N],
+        "Train": [len(train)],
+        "Test": [len(test)],
+        "OLS_MSE": [mse_ols],
+        "OLS_MAE": [mae_ols],
+        "OLS_mean_error": [me_ols],
+        "RF_MSE": [mse_rf],
+        "RF_MAE": [mae_rf],
+        "RF_mean_error": [me_rf],
+    })
+
+    # latex table
+    latex_path = output_path_tables / f"{save_prefix}_metrics.tex"
+    metrics.to_latex(latex_path, index=False, float_format="%.6f")
+    
+    
+    #predictions + errors table
+    pred_df = pd.DataFrame({
+        "Date": test["Date"].values,
+        "y_true": y_te.values,
+        "pred_ols": pred_ols.values,
+        "pred_rf": pred_rf,
+        "err_ols": err_ols,
+        "err_rf": err_rf
+    })
+
+
+    #plot true vs predictions
+    plt.figure(figsize=(10,4))
+    plt.plot(pred_df["Date"], pred_df["y_true"], label="True logRV(t+1)")
+    plt.plot(pred_df["Date"], pred_df["pred_ols"], label="LogHAR (OLS) pred", linestyle="--")
+    plt.plot(pred_df["Date"], pred_df["pred_rf"], label="RF pred", linestyle="--", color="lightgreen")
+    plt.title(f"Test forecasts: {label}")
+    plt.legend()
+    plt.tight_layout()
+    fig_path = output_path_pic / f"{save_prefix}_test_forecasts.png"
+    plt.savefig(fig_path, dpi=200)
+    plt.close()
+
+    # plot error comparisons
+    plt.figure(figsize=(10,4))
+    plt.plot(pred_df["Date"], pred_df["err_ols"], label="OLS error", linestyle="solid")
+    plt.plot(pred_df["Date"], pred_df["err_rf"], label="RF error", linestyle="--")
+    plt.axhline(0.0)
+    plt.title(f"Test forecast errors (logRV): {label}")
+    plt.legend()
+    plt.tight_layout()
+    fig_path2 = output_path_pic / f"{save_prefix}_test_errors.png"
+    plt.savefig(fig_path2, dpi=200)
+    plt.close()
+
+    return metrics, pred_df, ols, rf
+
+#Helper function to construct OLS results table in LaTeX format
+def _stars(p):
+    if pd.isna(p):
+        return ""
+    if p < 0.01:
+        return "***"
+    elif p < 0.05:
+        return "**"
+    elif p < 0.10:
+        return "*"
+    return ""
+    
+    
+def _fmt_coef_se(coef, se, pval, digits=4):
+    if pd.isna(coef):
+        return ""
+    s = _stars(pval)
+    return f"{coef:.{digits}f}{s}\n({se:.{digits}f})"
+    
+def ols_two_model_latex(ols_a, ols_b, colnames=("Full sample", "Latest 10y"),
+                        var_order=("const", "logRV", "logRV5", "logRV22"),
+                        var_labels=None, digits=4):
+    """
+    Returns a DataFrame where each cell is 'coef***\n(se)' and can be exported to LaTeX.
+    """
+
+    if var_labels is None:
+        var_labels = {
+            "const": "Constant",
+            "logRV": r"$\log RV_t$",
+            "logRV5": r"$\log RV_{t-5,t}$",
+            "logRV22": r"$\log RV_{t-22,t}$",
+        }
+
+    def extract(res):
+        return res.params, res.bse, res.pvalues
+
+    pA, seA, pvA = extract(ols_a)
+    pB, seB, pvB = extract(ols_b)
+
+    rows = []
+    for v in var_order:
+        cellA = _fmt_coef_se(pA.get(v, np.nan), seA.get(v, np.nan), pvA.get(v, np.nan), digits=digits)
+        cellB = _fmt_coef_se(pB.get(v, np.nan), seB.get(v, np.nan), pvB.get(v, np.nan), digits=digits)
+        rows.append([cellA, cellB])
+
+    tab = pd.DataFrame(rows, index=[var_labels.get(v, v) for v in var_order], columns=list(colnames))
+
+    # Add model stats at the bottom
+    stats = pd.DataFrame({
+        colnames[0]: [
+            f"{int(ols_a.nobs)}",
+            f"{ols_a.rsquared:.{digits}f}",
+        ],
+        colnames[1]: [
+            f"{int(ols_b.nobs)}",
+            f"{ols_b.rsquared:.{digits}f}",
+        ],
+    }, index=["Observations", r"$R^2$"])
+
+    tab = pd.concat([tab, stats], axis=0)
+    return tab
+
+#entire sample
+metrics_full, preds_full, ols_full, rf_full = fit_eval_one_sample(
+    D_full,
+    label="Full merged sample (from earliest available date)",
+    save_prefix="rv_forecast_full_sample"
+)
+
+#latest 10 years (ending at sample end)
+end_date = D_full["Date"].max()
+start_10y = end_date - pd.DateOffset(years=10)
+D_10y = D_full[D_full["Date"] >= start_10y].copy()
+
+metrics_10y, preds_10y, ols_10y, rf_10y = fit_eval_one_sample(
+    D_10y,
+    label="Latest 10 years (ending at sample end)",
+    save_prefix="rv_forecast_latest_10y"
+)
+
+ols_tab = ols_two_model_latex(
+    ols_full, ols_10y,
+    colnames=("Full sample", "Latest 10 years")
+)
+
+latex_path = output_path_tables / "ols_har_full_vs_10y.tex"
+ols_tab.to_latex(
+    latex_path,
+    escape=False,          # allow math in labels
+    header=True,
+    index=True
+)
+
+print(ols_tab)
+print("Saved:", latex_path)
