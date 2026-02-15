@@ -26,12 +26,7 @@ output_path_tables.mkdir(parents=True, exist_ok=True)
 # ======================================================================
 # Q1
 # ======================================================================
-# # Q1
-
-# ======================================================================
-# Q1.1
-# ======================================================================
-# ## Q1.1
+## Q1.1
 
 N = 50
 T = 100
@@ -99,10 +94,7 @@ plt.show()
 out_path = output_path_pic / "A2_Fig1.png" 
 fig.savefig(out_path, dpi=300, bbox_inches="tight")
 
-# ======================================================================
-# Q1.2
-# ======================================================================
-# ## Q1.2
+## Q1.2
 
 def cov1Para(Y,k = None): #the code to obtain this linear shrinkage function is 
                           #retrieved from the following github repository: https://github.com/pald22/covShrinkage/blob/main/cov1Para.py
@@ -186,10 +178,7 @@ plt.show()
 out_path = output_path_pic / "A2_Fig2.png" 
 fig.savefig(out_path, dpi=300, bbox_inches="tight")
 
-# ======================================================================
-# Q1.3
-# ======================================================================
-# ## Q1.3
+## Q1.3
 
 oracle_eigs = np.zeros((B, N))
 sigma_oracle = np.zeros((B, N, N))
@@ -232,10 +221,7 @@ plt.show()
 print(avg_eigs_oracle)
 print(pop_eigs)
 
-# ======================================================================
-# Q1.4
-# ======================================================================
-# ## Q1.4
+## Q1.4
 
 def make_equicorr_sigma(N, rho):
     I = np.eye(N)
@@ -592,7 +578,7 @@ for p in saved_paths:
 # ======================================================================
 # Q2
 # ======================================================================
-# # Q2
+
 
 #GSPC
 gspc_path = "GSPC.csv"  
@@ -628,10 +614,7 @@ df = pd.merge(gspc_sub[["Date","r"]],
               rv_sub[["Date","RV","logRV"]],
               on="Date", how="inner").sort_values("Date")
 
-# ======================================================================
-# Q2.1
-# ======================================================================
-# ## Q2.1 - Q2.2
+## Q2.1 - Q2.2
 
 machine_zero = 1e-12  # variance floor used only for numerical safety
 
@@ -937,10 +920,7 @@ latex_code = results_to_latex(
 
 save_latex_table(latex_code, output_path_tables, filename="qml_garch_results.tex")
 
-# ======================================================================
-# Q2.3
-# ======================================================================
-# ## Q2.3 - 2.4
+## Q2.3 - 2.4
 
 
 #data constriction for HAR model
@@ -1165,7 +1145,7 @@ metrics_10y, preds_10y, ols_10y, rf_10y = fit_eval_one_sample(
     save_prefix="rv_forecast_latest_10y"
 )
 
-ols_tab = ols_two_model_latex(
+ols_tab = ols_two_model_latex( #comparison of the OLS estimates for the two sets of data
     ols_full, ols_10y,
     colnames=("Full sample", "Latest 10 years")
 )
@@ -1173,7 +1153,7 @@ ols_tab = ols_two_model_latex(
 latex_path = output_path_tables / "ols_har_full_vs_10y.tex"
 ols_tab.to_latex(
     latex_path,
-    escape=False,          # allow math in labels
+    escape=False,         
     header=True,
     index=True
 )
